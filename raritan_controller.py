@@ -88,46 +88,123 @@ class PDUConfig:
             self._ssh_client.close()
             self._ssh_client = None
     
+    def _read_until_prompt(self, shell, prompt: str, timeout: int) -> str:
+        """Read from the shell until the prompt is seen or timeout occurs. Returns the full buffer."""
+        output = ""
+        start_time = time.time()
+        while True:
+            if shell.recv_ready():
+                try:
+                    chunk = shell.recv(4096).decode('utf-8', errors='replace')
+                    output += chunk
+                    logger.debug(f"[SHELL READ] {chunk!r}")
+                except Exception as e:
+                    logger.error(f"Error reading from shell: {e}")
+                    break
+                if prompt in output:
+                    break
+            if time.time() - start_time > timeout:
+                logger.error(f"Timeout waiting for prompt '{prompt}'. Buffer so far:\n{output}")
+                break
+            time.sleep(0.1)
+        return output
+
+    def _read_until_banner(self, shell, banner_regex: str, timeout: int) -> str:
+        output = ""
+        start_time = time.time()
+        while True:
+            if shell.recv_ready():
+                try:
+                    chunk = shell.recv(4096).decode('utf-8', errors='replace')
+                    output += chunk
+                    logger.debug(f"[SHELL READ] {chunk!r}")
+                    if re.search(banner_regex, output):
+                        break
+                except Exception as e:
+                    logger.error(f"Error reading from shell: {e}")
+                    break
+            if time.time() - start_time > timeout:
+                logger.error(f"Timeout waiting for banner. Buffer so far:\\n{output}")
+                break
+            time.sleep(0.1)
+        return output
+
     def execute_command(self, command: str) -> Tuple[str, str]:
-        """Execute a command on the PDU and return stdout and stderr"""
+        """Execute a command on the PDU using an interactive shell and return stdout and stderr, with robust debug logging."""
         if not self._ssh_client or not self._ssh_client.get_transport() or not self._ssh_client.get_transport().is_active():
             if not self.connect():
                 return "", f"Failed to connect to PDU {self.ip}"
-        
         try:
-            logger.debug(f"Executing command on PDU {self.ip}: {command}")
-            stdin, stdout, stderr = self._ssh_client.exec_command(command, timeout=COMMAND_TIMEOUT)
-            stdout_str = stdout.read().decode('utf-8')
-            stderr_str = stderr.read().decode('utf-8')
+            logger.debug(f"Preparing to execute command on PDU {self.ip}: {command}")
+            shell = self._ssh_client.invoke_shell()
+            shell.settimeout(COMMAND_TIMEOUT)
+            prompt = self.prompt
+            banner_regex = r"Welcome to .+ CLI!"
+            shell.send("\n")
+            # Wait for the banner
+            initial_output = self._read_until_banner(shell, banner_regex, 5)
+            if not re.search(banner_regex, initial_output):
+                return "", f"Timeout waiting for welcome banner. Buffer:\n{initial_output}"
             
-            # Check for errors in Raritan's output
-            # Some PDUs report errors in stdout rather than stderr
-            if "Error:" in stdout_str:
-                stderr_str += stdout_str
-                stdout_str = ""
-                
-            logger.debug(f"Command response from PDU {self.ip}: {stdout_str}")
-            if stderr_str:
-                logger.warning(f"Command errors from PDU {self.ip}: {stderr_str}")
-                
-            return stdout_str, stderr_str
-        
-        except (SSHException, socket.error, socket.timeout) as e:
+            # Wait 1 second, then check for prompt
+            time.sleep(1)
+            
+            # Read a bit more to get the full prompt
+            additional_output = ""
+            start_time = time.time()
+            while time.time() - start_time < 3:  # Read for up to 3 more seconds
+                if shell.recv_ready():
+                    chunk = shell.recv(4096).decode('utf-8', errors='replace')
+                    additional_output += chunk
+                    logger.debug(f"[SHELL READ] {chunk!r}")
+                time.sleep(0.1)
+            
+            full_output = initial_output + additional_output
+            
+            # Try to detect the actual prompt automatically
+            prompt_match = re.search(r'\r\n(.+?)(\s*>|\s*#)\s*$', full_output)
+            if prompt_match:
+                detected_prompt = prompt_match.group(0).strip()
+                if detected_prompt and prompt != detected_prompt:
+                    logger.debug(f"Detected different prompt: '{detected_prompt}', was using: '{prompt}'")
+                    prompt = detected_prompt
+            
+            if prompt not in full_output:
+                # Read until prompt appears (shorter timeout)
+                prompt_output = self._read_until_prompt(shell, prompt, 10)
+                full_output += prompt_output
+                if prompt not in full_output:
+                    return "", f"Timeout waiting for prompt after banner. Buffer:\n{full_output}"
+            
+            # Now send the command
+            logger.debug(f"Executing command on PDU {self.ip}: {command}")
+            shell.send(command + "\n")
+            cmd_output = self._read_until_prompt(shell, prompt, COMMAND_TIMEOUT)
+            if prompt not in cmd_output:
+                return "", f"Timeout waiting for command prompt. Buffer:\n{cmd_output}"
+            
+            # Remove echoed command and prompt from output
+            lines = cmd_output.splitlines()
+            for i, line in enumerate(lines[:2]):
+                if command.strip() == line.strip():
+                    lines = lines[i+1:]
+                    break
+            while lines and prompt.strip() in lines[-1]:
+                lines = lines[:-1]
+            output = "\n".join(lines)
+            return output, ""
+        except Exception as e:
             logger.error(f"Error executing command on PDU {self.ip}: {e}")
-            # Force disconnect to get fresh connection on next attempt
             self.disconnect()
             return "", str(e)
 
 class ServerConfig:
-    """Class representing a server with its outlets"""
-    
-    def __init__(self, name: str, bmc_ip: Optional[str] = None, outlets: Optional[List[Dict[str, Any]]] = None):
+    """Class representing a server with its outlets (new YAML format)"""
+    def __init__(self, name: str, outlets: Optional[list] = None):
         self.name = name
-        self.bmc_ip = bmc_ip
         self.outlets = outlets or []
-        
     def __repr__(self) -> str:
-        return f"ServerConfig(name={self.name}, bmc_ip={self.bmc_ip}, outlets={len(self.outlets)})"
+        return f"ServerConfig(name={self.name}, outlets={len(self.outlets)})"
 
 class RaritanController:
     """Main controller class for Raritan PDUs"""
@@ -137,112 +214,125 @@ class RaritanController:
         self.defaults = {}
         self.pdus: Dict[str, PDUConfig] = {}
         self.servers: Dict[str, ServerConfig] = {}
-        
+        self.server_name_map: Dict[str, str] = {}  # Map original hostname to simplified name
         self.load_config()
     
     def load_config(self) -> None:
-        """Load configuration from YAML file"""
+        """Load configuration from YAML file (adapted for new format)"""
         try:
             with open(self.config_file, 'r') as f:
                 config = yaml.safe_load(f)
-                
-            # Load defaults
             self.defaults = config.get('defaults', {})
-            
-            # Load PDUs
-            for pdu_ip, pdu_config in config.get('pdus', {}).items():
-                # Handle template variables in configuration
-                username = self._process_template_var(pdu_config.get('username', ''), self.defaults)
-                password = self._process_template_var(pdu_config.get('password', ''), self.defaults)
-                port = int(self._process_template_var(pdu_config.get('port', 22), self.defaults))
-                prompt = self._process_template_var(pdu_config.get('prompt', 'cli>'), self.defaults)
-                
-                self.pdus[pdu_ip] = PDUConfig(
-                    ip=pdu_ip,
+            for pdu_name, pdu_config in config.get('pdus', {}).items():
+                username = self._process_template_var(pdu_config.get('username', ''), self.defaults, 'username')
+                password = self._process_template_var(pdu_config.get('password', ''), self.defaults, 'password')
+                port = int(self._process_template_var(pdu_config.get('port', 22), self.defaults, 'port'))
+                prompt = self._process_template_var(pdu_config.get('prompt', 'cli>'), self.defaults, 'prompt')
+                # Use the actual IP address from the pdu_config for connection
+                self.pdus[pdu_name] = PDUConfig(
+                    ip=pdu_config.get('ip', pdu_name),
                     username=username,
                     password=password,
                     port=port,
                     prompt=prompt
                 )
-            
-            # Load servers
-            for server_name, server_config in config.get('servers', {}).items():
-                outlets = server_config.get('outlets', [])
+            # Load servers (new format)
+            for server_name, server_list in config.get('servers', {}).items():
+                if not isinstance(server_list, list) or not server_list:
+                    continue
+                server_entry = server_list[0]
+                outlets = server_entry.get('outlets', [])
+                # Try to recover the original hostname if present in the outlets or elsewhere
+                # If the original name is different from the simplified name, store the mapping
+                orig_name = server_entry.get('orig_name', None)
+                if orig_name and orig_name != server_name:
+                    self.server_name_map[orig_name] = server_name
                 self.servers[server_name] = ServerConfig(
                     name=server_name,
-                    bmc_ip=server_config.get('bmc_ip'),
                     outlets=outlets
                 )
-                
             logger.info(f"Loaded {len(self.pdus)} PDUs and {len(self.servers)} servers from {self.config_file}")
-            
         except (IOError, yaml.YAMLError) as e:
             logger.error(f"Error loading configuration from {self.config_file}: {e}")
             sys.exit(1)
     
-    def _process_template_var(self, value: Any, defaults: Dict[str, Any]) -> Any:
-        """Process template variables in configuration"""
+    def _process_template_var(self, value: Any, defaults: Dict[str, Any], key: str = None) -> Any:
+        """Process template variables in configuration, and use default if value is missing or empty"""
         if isinstance(value, str) and value.startswith('#{defaults.'):
             var_name = value.split('.')[1].rstrip('}')
             return defaults.get(var_name, value)
+        # If value is None or empty string, use the default for this key
+        if (value is None or value == '') and key is not None and key in defaults:
+            return defaults[key]
         return value
     
     def get_server_config(self, server_name: str) -> Optional[ServerConfig]:
-        """Get server configuration by name"""
-        return self.servers.get(server_name)
+        """Get server configuration by name, supporting both original and simplified names"""
+        if server_name in self.servers:
+            return self.servers[server_name]
+        # Try mapping from original hostname to simplified name
+        mapped = self.server_name_map.get(server_name)
+        if mapped and mapped in self.servers:
+            return self.servers[mapped]
+        return None
     
     def get_pdu_config(self, pdu_ip: str) -> Optional[PDUConfig]:
         """Get PDU configuration by IP address"""
         return self.pdus.get(pdu_ip)
     
-    def power_on_outlet(self, pdu_ip: str, outlet: int) -> bool:
-        """Power on a specific outlet on a PDU"""
+    def power_on_outlet(self, pdu_ip: str, outlets: Union[int, list]) -> bool:
+        """Power on one or more outlets on a PDU (new command format)"""
         pdu = self.get_pdu_config(pdu_ip)
         if not pdu:
             logger.error(f"No configuration found for PDU {pdu_ip}")
             return False
-        
-        command = f"set /system1/outlet{outlet} powerState=on"
+        if isinstance(outlets, int):
+            outlet_list = [outlets]
+        else:
+            outlet_list = outlets
+        outlet_str = ','.join(str(o) for o in outlet_list)
+        command = f"power outlets {outlet_str} on /y"
         stdout, stderr = pdu.execute_command(command)
-        
         if stderr:
-            logger.error(f"Error powering on outlet {outlet} on PDU {pdu_ip}: {stderr}")
+            logger.error(f"Error powering on outlet(s) {outlet_str} on PDU {pdu_ip}: {stderr}")
             return False
-        
-        logger.info(f"Powered on outlet {outlet} on PDU {pdu_ip}")
+        logger.info(f"Powered on outlet(s) {outlet_str} on PDU {pdu_ip}")
         return True
-    
-    def power_off_outlet(self, pdu_ip: str, outlet: int) -> bool:
-        """Power off a specific outlet on a PDU"""
+
+    def power_off_outlet(self, pdu_ip: str, outlets: Union[int, list]) -> bool:
+        """Power off one or more outlets on a PDU (new command format)"""
         pdu = self.get_pdu_config(pdu_ip)
         if not pdu:
             logger.error(f"No configuration found for PDU {pdu_ip}")
             return False
-        
-        command = f"set /system1/outlet{outlet} powerState=off"
+        if isinstance(outlets, int):
+            outlet_list = [outlets]
+        else:
+            outlet_list = outlets
+        outlet_str = ','.join(str(o) for o in outlet_list)
+        command = f"power outlets {outlet_str} off /y"
         stdout, stderr = pdu.execute_command(command)
-        
         if stderr:
-            logger.error(f"Error powering off outlet {outlet} on PDU {pdu_ip}: {stderr}")
+            logger.error(f"Error powering off outlet(s) {outlet_str} on PDU {pdu_ip}: {stderr}")
             return False
-        
-        logger.info(f"Powered off outlet {outlet} on PDU {pdu_ip}")
+        logger.info(f"Powered off outlet(s) {outlet_str} on PDU {pdu_ip}")
         return True
-    
-    def power_cycle_outlet(self, pdu_ip: str, outlet: int, delay: Optional[int] = None) -> bool:
-        """Power cycle a specific outlet on a PDU"""
+
+    def power_cycle_outlet(self, pdu_ip: str, outlets: Union[int, list], delay: Optional[int] = None) -> bool:
+        """Power cycle one or more outlets on a PDU (new command format)"""
         delay = delay or self.defaults.get('power_on_delay', 5)
-        
-        # First power off
-        if not self.power_off_outlet(pdu_ip, outlet):
+        if isinstance(outlets, int):
+            outlet_list = [outlets]
+        else:
+            outlet_list = outlets
+        outlet_str = ','.join(str(o) for o in outlet_list)
+        # Power off
+        if not self.power_off_outlet(pdu_ip, outlet_list):
             return False
-        
-        # Wait for the specified delay
-        logger.info(f"Waiting {delay} seconds before powering on outlet {outlet} on PDU {pdu_ip}")
+        logger.info(f"Waiting {delay} seconds before powering on outlet(s) {outlet_str} on PDU {pdu_ip}")
         time.sleep(delay)
-        
-        # Then power on
-        return self.power_on_outlet(pdu_ip, outlet)
+        # Power on
+        return self.power_on_outlet(pdu_ip, outlet_list)
     
     def get_outlet_status(self, pdu_ip: str, outlet: int) -> Optional[str]:
         """Get the status of a specific outlet on a PDU"""
@@ -291,160 +381,117 @@ class RaritanController:
         return results
     
     def operate_on_server(self, server_name: str, operation: str) -> bool:
-        """Perform a power operation on all outlets for a server"""
+        """Perform a power operation on all outlets for a server (new YAML format, new command format)"""
         server = self.get_server_config(server_name)
         if not server:
             logger.error(f"No configuration found for server {server_name}")
             return False
-        
         if not server.outlets:
             logger.error(f"No outlets configured for server {server_name}")
             return False
-        
         success = True
-        # Track PDUs that have been used to avoid multiple connections
         used_pdus = set()
-        
         try:
-            # Process each outlet
+            # Group outlets by PDU for batch command
+            pdu_outlet_map = {}
             for outlet_config in server.outlets:
-                pdu_ip = outlet_config['pdu']
-                outlet = outlet_config['outlet']
-                
+                pdu_ip = outlet_config['pdu_name']
+                outlet_number = outlet_config['outlet_number']
+                if isinstance(outlet_number, int):
+                    outlet_numbers = [outlet_number]
+                elif isinstance(outlet_number, str):
+                    outlet_numbers = [int(x.strip()) for x in outlet_number.split(',') if x.strip()]
+                else:
+                    continue
+                if pdu_ip not in pdu_outlet_map:
+                    pdu_outlet_map[pdu_ip] = []
+                pdu_outlet_map[pdu_ip].extend(outlet_numbers)
+            for pdu_ip, outlet_list in pdu_outlet_map.items():
                 pdu = self.get_pdu_config(pdu_ip)
                 if not pdu:
                     logger.error(f"No configuration found for PDU {pdu_ip}")
                     success = False
                     continue
-                
-                # Connect to PDU if not already connected
                 if pdu_ip not in used_pdus:
                     if not pdu.connect():
                         logger.error(f"Failed to connect to PDU {pdu_ip}")
                         success = False
                         continue
                     used_pdus.add(pdu_ip)
-                
-                # Perform the requested operation
                 result = False
                 if operation == 'on':
-                    result = self.power_on_outlet(pdu_ip, outlet)
+                    result = self.power_on_outlet(pdu_ip, outlet_list)
                 elif operation == 'off':
-                    result = self.power_off_outlet(pdu_ip, outlet)
+                    result = self.power_off_outlet(pdu_ip, outlet_list)
                 elif operation == 'cycle':
-                    result = self.power_cycle_outlet(pdu_ip, outlet)
-                
+                    result = self.power_cycle_outlet(pdu_ip, outlet_list)
                 success = success and result
-            
             return success
-        
         finally:
-            # Always disconnect from all used PDUs
             for pdu_ip in used_pdus:
                 pdu = self.get_pdu_config(pdu_ip)
                 if pdu:
                     pdu.disconnect()
     
     def get_server_outlet_status(self, server_name: str) -> Dict[str, Dict[int, str]]:
-        """Get the status of all outlets for a server"""
+        """Get the status of all outlets for a server (new YAML format)"""
         server = self.get_server_config(server_name)
         if not server:
             logger.error(f"No configuration found for server {server_name}")
             return {}
-        
         if not server.outlets:
             logger.error(f"No outlets configured for server {server_name}")
             return {}
-        
         results = {}
-        # Track PDUs that have been used to avoid multiple connections
         used_pdus = set()
-        
         try:
             for outlet_config in server.outlets:
-                pdu_ip = outlet_config['pdu']
-                outlet = outlet_config['outlet']
-                
+                pdu_ip = outlet_config['pdu_name']
+                outlet_number = outlet_config['outlet_number']
+                if isinstance(outlet_number, int):
+                    outlet_numbers = [outlet_number]
+                elif isinstance(outlet_number, str):
+                    outlet_numbers = [int(x.strip()) for x in outlet_number.split(',') if x.strip()]
+                else:
+                    continue
                 pdu = self.get_pdu_config(pdu_ip)
                 if not pdu:
                     logger.error(f"No configuration found for PDU {pdu_ip}")
                     continue
-                
-                # Connect to PDU if not already connected
                 if pdu_ip not in used_pdus:
                     if not pdu.connect():
                         logger.error(f"Failed to connect to PDU {pdu_ip}")
                         continue
                     used_pdus.add(pdu_ip)
-                
-                # Initialize PDU results if not already done
                 if pdu_ip not in results:
                     results[pdu_ip] = {}
-                
-                # Get status for this outlet
-                status = self.get_outlet_status(pdu_ip, outlet)
-                if status:
-                    results[pdu_ip][outlet] = status
-            
+                for outlet in outlet_numbers:
+                    status = self.get_outlet_status(pdu_ip, outlet)
+                    if status:
+                        results[pdu_ip][outlet] = status
             return results
-        
         finally:
-            # Always disconnect from all used PDUs
             for pdu_ip in used_pdus:
                 pdu = self.get_pdu_config(pdu_ip)
                 if pdu:
                     pdu.disconnect()
 
 def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Raritan PDU Controller')
-    
-    # Define commands
-    subparsers = parser.add_subparsers(dest='command', help='Command to execute')
-    
-    # On command
-    on_parser = subparsers.add_parser('on', help='Power on outlets')
-    on_group = on_parser.add_mutually_exclusive_group(required=True)
-    on_group.add_argument('server', nargs='?', help='Server name to power on')
-    on_group.add_argument('--pdu', help='PDU IP address')
-    on_parser.add_argument('--outlet', type=int, help='Outlet number (required with --pdu)')
-    
-    # Off command
-    off_parser = subparsers.add_parser('off', help='Power off outlets')
-    off_group = off_parser.add_mutually_exclusive_group(required=True)
-    off_group.add_argument('server', nargs='?', help='Server name to power off')
-    off_group.add_argument('--pdu', help='PDU IP address')
-    off_parser.add_argument('--outlet', type=int, help='Outlet number (required with --pdu)')
-    
-    # Cycle command
-    cycle_parser = subparsers.add_parser('cycle', help='Power cycle outlets')
-    cycle_group = cycle_parser.add_mutually_exclusive_group(required=True)
-    cycle_group.add_argument('server', nargs='?', help='Server name to power cycle')
-    cycle_group.add_argument('--pdu', help='PDU IP address')
-    cycle_parser.add_argument('--outlet', type=int, help='Outlet number (required with --pdu)')
-    cycle_parser.add_argument('--delay', type=int, help='Delay in seconds between power off and power on')
-    
-    # Status command
-    status_parser = subparsers.add_parser('status', help='Check outlet status')
-    status_group = status_parser.add_mutually_exclusive_group(required=True)
-    status_group.add_argument('server', nargs='?', help='Server name to check status')
-    status_group.add_argument('--pdu', help='PDU IP address')
-    status_parser.add_argument('--outlet', type=int, help='Outlet number (optional with --pdu)')
-    
-    # Global options
+    """Parse command line arguments (server first, command last)"""
+    parser = argparse.ArgumentParser(description='Raritan PDU Controller (server first, command last)')
+    parser.add_argument('server', nargs='?', help='Server name to operate on (or leave blank if using --pdu)')
+    parser.add_argument('--pdu', help='PDU IP address')
+    parser.add_argument('--outlet', type=int, help='Outlet number (required with --pdu)')
+    parser.add_argument('--delay', type=int, help='Delay in seconds between power off and power on (for cycle)')
     parser.add_argument('--config', default=CONFIG_FILE, help='Configuration file path')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
-    
+    parser.add_argument('command', choices=['on', 'off', 'cycle', 'status'], help='Power command to execute')
     args = parser.parse_args()
-    
     # Validate arguments
-    if args.command is None:
-        parser.print_help()
-        sys.exit(1)
-    
-    if getattr(args, 'pdu', None) and args.command != 'status' and getattr(args, 'outlet', None) is None:
+    if not args.server and not args.pdu:
+        parser.error('You must specify either a server name or --pdu')
+    if args.pdu and args.command != 'status' and args.outlet is None:
         parser.error('--outlet is required when specifying --pdu (except with status command)')
-    
     return args
 
 def format_status_table(results: Dict[str, Dict[int, str]], server_name: Optional[str] = None) -> str:
@@ -459,42 +506,35 @@ def format_status_table(results: Dict[str, Dict[int, str]], server_name: Optiona
     return table.get_string()
 
 def main():
-    """Main entry point"""
+    """Main entry point (server first, command last)"""
     args = parse_arguments()
-    
-    # Configure verbose logging if requested
     if args.verbose:
         logger.setLevel(logging.DEBUG)
-    
     controller = RaritanController(config_file=args.config)
-    
     # Execute the requested command
     if args.command == 'on':
-        if getattr(args, 'server', None):
+        if args.server:
             success = controller.operate_on_server(args.server, 'on')
             print(f"Power on {'successful' if success else 'failed'} for server {args.server}")
         else:
             success = controller.power_on_outlet(args.pdu, args.outlet)
             print(f"Power on {'successful' if success else 'failed'} for outlet {args.outlet} on PDU {args.pdu}")
-    
     elif args.command == 'off':
-        if getattr(args, 'server', None):
+        if args.server:
             success = controller.operate_on_server(args.server, 'off')
             print(f"Power off {'successful' if success else 'failed'} for server {args.server}")
         else:
             success = controller.power_off_outlet(args.pdu, args.outlet)
             print(f"Power off {'successful' if success else 'failed'} for outlet {args.outlet} on PDU {args.pdu}")
-    
     elif args.command == 'cycle':
-        if getattr(args, 'server', None):
+        if args.server:
             success = controller.operate_on_server(args.server, 'cycle')
             print(f"Power cycle {'successful' if success else 'failed'} for server {args.server}")
         else:
             success = controller.power_cycle_outlet(args.pdu, args.outlet, args.delay)
             print(f"Power cycle {'successful' if success else 'failed'} for outlet {args.outlet} on PDU {args.pdu}")
-    
     elif args.command == 'status':
-        if getattr(args, 'server', None):
+        if args.server:
             results = controller.get_server_outlet_status(args.server)
             print(format_status_table(results, args.server))
         else:
@@ -502,21 +542,17 @@ def main():
             if not pdu:
                 logger.error(f"No configuration found for PDU {args.pdu}")
                 sys.exit(1)
-            
             try:
                 if not pdu.connect():
                     logger.error(f"Failed to connect to PDU {args.pdu}")
                     sys.exit(1)
-                
-                if getattr(args, 'outlet', None) is not None:
+                if args.outlet is not None:
                     status = controller.get_outlet_status(args.pdu, args.outlet)
                     results = {args.pdu: {args.outlet: status}} if status else {}
                 else:
                     status_dict = controller.get_all_pdu_outlet_status(args.pdu)
                     results = {args.pdu: status_dict}
-                
                 print(format_status_table(results))
-            
             finally:
                 pdu.disconnect()
 
