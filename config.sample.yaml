@@ -1,0 +1,38 @@
+defaults:
+  username: "your_username_here"
+  password: "your_password_here"
+  port: 22
+  prompt: "cli>"
+  power_on_delay: 5
+
+pdus:
+  10.0.0.1:
+    ip: 10.0.0.1
+    username: "#{defaults.username}"
+    password: "#{defaults.password}"
+    port: "#{defaults.port}"
+    prompt: "#{defaults.prompt}"
+  10.0.0.2:
+    ip: 10.0.0.2
+    username: "#{defaults.username}"
+    password: "#{defaults.password}"
+    port: "#{defaults.port}"
+    prompt: "#{defaults.prompt}"
+
+servers:
+  server1:
+    name: server1
+    bmc_ip: 10.1.1.1
+    outlets:
+      - pdu: 10.0.0.1
+        outlet: 1
+      - pdu: 10.0.0.2
+        outlet: 2
+  server2:
+    name: server2
+    bmc_ip: 10.1.1.2
+    outlets:
+      - pdu: 10.0.0.1
+        outlet: 3
+      - pdu: 10.0.0.1
+        outlet: 4 
