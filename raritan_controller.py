@@ -31,7 +31,7 @@ CONFIG_FILE = 'config.yaml'
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 CONNECTION_TIMEOUT = 10
-COMMAND_TIMEOUT = 30
+COMMAND_TIMEOUT = 10
 
 class PDUConfig:
     """Class representing a PDU configuration"""
@@ -129,70 +129,158 @@ class PDUConfig:
             time.sleep(0.1)
         return output
 
-    def execute_command(self, command: str) -> Tuple[str, str]:
-        """Execute a command on the PDU using an interactive shell and return stdout and stderr, with robust debug logging."""
+    def execute_command(self, command: str, verify_status: bool = False, expected_status: str = None) -> Tuple[str, str]:
+        """
+        Execute a command on the PDU using an interactive shell and return stdout and stderr.
+        
+        Steps:
+        1. Wait for welcome banner
+        2. Wait for initial output to stabilize (prompt might be empty)
+        3. Issue command
+        4. Check if outlet status matches expected status (if verification requested)
+        
+        Args:
+            command: The command to execute
+            verify_status: Whether to verify outlet status after command
+            expected_status: Expected status if verify_status is True ("on"/"off")
+        
+        Returns:
+            Tuple of (stdout, stderr)
+        """
         if not self._ssh_client or not self._ssh_client.get_transport() or not self._ssh_client.get_transport().is_active():
             if not self.connect():
                 return "", f"Failed to connect to PDU {self.ip}"
+                
         try:
             logger.debug(f"Preparing to execute command on PDU {self.ip}: {command}")
             shell = self._ssh_client.invoke_shell()
             shell.settimeout(COMMAND_TIMEOUT)
-            prompt = self.prompt
-            banner_regex = r"Welcome to .+ CLI!"
-            shell.send("\n")
-            # Wait for the banner
-            initial_output = self._read_until_banner(shell, banner_regex, 5)
-            if not re.search(banner_regex, initial_output):
-                return "", f"Timeout waiting for welcome banner. Buffer:\n{initial_output}"
             
-            # Wait 1 second, then check for prompt
-            time.sleep(1)
-            
-            # Read a bit more to get the full prompt
-            additional_output = ""
+            # Step 1: Wait for welcome banner or initial output
+            logger.debug("Step 1: Waiting for welcome banner or initial output")
+            initial_output = ""
             start_time = time.time()
-            while time.time() - start_time < 3:  # Read for up to 3 more seconds
+            
+            while time.time() - start_time < COMMAND_TIMEOUT:
                 if shell.recv_ready():
                     chunk = shell.recv(4096).decode('utf-8', errors='replace')
-                    additional_output += chunk
-                    logger.debug(f"[SHELL READ] {chunk!r}")
+                    initial_output += chunk
+                    logger.debug(f"[INITIAL READ] {chunk!r}")
+                    # Look for common banner patterns
+                    if "Last login:" in initial_output or "Welcome" in initial_output:
+                        logger.debug("Banner or login message detected")
+                        break
                 time.sleep(0.1)
             
-            full_output = initial_output + additional_output
+            # Step 2: Wait for initial output to stabilize (the terminal is ready for input)
+            # This handles cases where the prompt is empty or difficult to detect
+            logger.debug("Step 2: Waiting for initial output to stabilize")
+            shell.send("\n")  # Send newline to trigger any prompt
             
-            # Try to detect the actual prompt automatically
-            prompt_match = re.search(r'\r\n(.+?)(\s*>|\s*#)\s*$', full_output)
-            if prompt_match:
-                detected_prompt = prompt_match.group(0).strip()
-                if detected_prompt and prompt != detected_prompt:
-                    logger.debug(f"Detected different prompt: '{detected_prompt}', was using: '{prompt}'")
-                    prompt = detected_prompt
+            # Wait briefly to see if anything comes back
+            stabilize_start = time.time()
+            stabilize_output = ""
+            last_output_time = stabilize_start
             
-            if prompt not in full_output:
-                # Read until prompt appears (shorter timeout)
-                prompt_output = self._read_until_prompt(shell, prompt, 10)
-                full_output += prompt_output
-                if prompt not in full_output:
-                    return "", f"Timeout waiting for prompt after banner. Buffer:\n{full_output}"
-            
-            # Now send the command
-            logger.debug(f"Executing command on PDU {self.ip}: {command}")
-            shell.send(command + "\n")
-            cmd_output = self._read_until_prompt(shell, prompt, COMMAND_TIMEOUT)
-            if prompt not in cmd_output:
-                return "", f"Timeout waiting for command prompt. Buffer:\n{cmd_output}"
-            
-            # Remove echoed command and prompt from output
-            lines = cmd_output.splitlines()
-            for i, line in enumerate(lines[:2]):
-                if command.strip() == line.strip():
-                    lines = lines[i+1:]
+            while time.time() - stabilize_start < 3:  # 3 seconds max to stabilize
+                if shell.recv_ready():
+                    chunk = shell.recv(4096).decode('utf-8', errors='replace')
+                    stabilize_output += chunk
+                    logger.debug(f"[STABILIZE READ] {chunk!r}")
+                    last_output_time = time.time()
+                
+                # If no new output for 1 second, we're probably at a stable state/prompt
+                if time.time() - last_output_time > 1:
+                    logger.debug("No new output for 1 second, terminal appears stable")
                     break
-            while lines and prompt.strip() in lines[-1]:
-                lines = lines[:-1]
-            output = "\n".join(lines)
+                    
+                time.sleep(0.1)
+            
+            # Step 3: Issue command
+            logger.debug(f"Step 3: Issuing command: {command}")
+            shell.send(command + "\n")
+            
+            # Wait for command to complete
+            cmd_output = ""
+            start_time = time.time()
+            last_output_time = start_time
+            
+            while time.time() - start_time < COMMAND_TIMEOUT:
+                if shell.recv_ready():
+                    chunk = shell.recv(4096).decode('utf-8', errors='replace')
+                    cmd_output += chunk
+                    logger.debug(f"[COMMAND READ] {chunk!r}")
+                    last_output_time = time.time()
+                
+                # If no new output for 2 seconds, command has likely completed
+                if time.time() - last_output_time > 2:
+                    logger.debug("No new output for 2 seconds, command appears complete")
+                    break
+                    
+                time.sleep(0.1)
+            
+            # Step 4: If requested, verify the outlet status matches expected status
+            if verify_status and expected_status:
+                # Parse the command to identify outlet number for verification
+                outlet_match = re.search(r'outlets\s+(\d+(?:,\d+)*)\s+(on|off)', command)
+                if outlet_match:
+                    outlets_str = outlet_match.group(1)
+                    expected_power_state = outlet_match.group(2).upper()
+                    outlets = [int(o.strip()) for o in outlets_str.split(',') if o.strip()]
+                    
+                    # Allow a short delay for status to update
+                    time.sleep(1)
+                    
+                    # Verify each outlet
+                    for outlet in outlets:
+                        status_cmd = f"show outlets {outlet}"
+                        shell.send(status_cmd + "\n")
+                        
+                        status_output = ""
+                        status_start_time = time.time()
+                        last_status_output_time = status_start_time
+                        
+                        while time.time() - status_start_time < COMMAND_TIMEOUT/2:  # Use half the timeout for status check
+                            if shell.recv_ready():
+                                chunk = shell.recv(4096).decode('utf-8', errors='replace')
+                                status_output += chunk
+                                logger.debug(f"[STATUS READ] {chunk!r}")
+                                last_status_output_time = time.time()
+                            
+                            # If no new output for 1 second, status command has completed
+                            if time.time() - last_status_output_time > 1:
+                                break
+                                
+                            time.sleep(0.1)
+                        
+                        # Parse status from output - adjust pattern to match the outlet status command format
+                        power_match = re.search(r'(on|off)', status_output, re.IGNORECASE)
+                        if power_match:
+                            actual_status = power_match.group(1).upper()
+                            if expected_power_state != actual_status:
+                                logger.error(f"Outlet {outlet} status verification failed. Expected: {expected_power_state}, Actual: {actual_status}")
+                                return "", f"Status verification failed for outlet {outlet}. Expected: {expected_power_state}, Actual: {actual_status}"
+                            else:
+                                logger.info(f"Verified outlet {outlet} status: {actual_status}")
+                        else:
+                            logger.warning(f"Could not verify status for outlet {outlet}")
+            
+            # Process the output (remove echo of command)
+            lines = cmd_output.splitlines()
+            clean_lines = []
+            
+            # Skip the echoed command line
+            command_found = False
+            for line in lines:
+                line_stripped = line.strip()
+                if not command_found and command.strip() in line_stripped:
+                    command_found = True
+                    continue
+                clean_lines.append(line)
+                
+            output = "\n".join(clean_lines).strip()
             return output, ""
+            
         except Exception as e:
             logger.error(f"Error executing command on PDU {self.ip}: {e}")
             self.disconnect()
@@ -227,7 +315,7 @@ class RaritanController:
                 username = self._process_template_var(pdu_config.get('username', ''), self.defaults, 'username')
                 password = self._process_template_var(pdu_config.get('password', ''), self.defaults, 'password')
                 port = int(self._process_template_var(pdu_config.get('port', 22), self.defaults, 'port'))
-                prompt = self._process_template_var(pdu_config.get('prompt', 'cli>'), self.defaults, 'prompt')
+                prompt = self._process_template_var(pdu_config.get('prompt', ''), self.defaults, 'prompt')
                 # Use the actual IP address from the pdu_config for connection
                 self.pdus[pdu_name] = PDUConfig(
                     ip=pdu_config.get('ip', pdu_name),
@@ -292,7 +380,7 @@ class RaritanController:
             outlet_list = outlets
         outlet_str = ','.join(str(o) for o in outlet_list)
         command = f"power outlets {outlet_str} on /y"
-        stdout, stderr = pdu.execute_command(command)
+        stdout, stderr = pdu.execute_command(command, verify_status=True, expected_status="ON")
         if stderr:
             logger.error(f"Error powering on outlet(s) {outlet_str} on PDU {pdu_ip}: {stderr}")
             return False
@@ -311,7 +399,7 @@ class RaritanController:
             outlet_list = outlets
         outlet_str = ','.join(str(o) for o in outlet_list)
         command = f"power outlets {outlet_str} off /y"
-        stdout, stderr = pdu.execute_command(command)
+        stdout, stderr = pdu.execute_command(command, verify_status=True, expected_status="OFF")
         if stderr:
             logger.error(f"Error powering off outlet(s) {outlet_str} on PDU {pdu_ip}: {stderr}")
             return False
@@ -341,7 +429,7 @@ class RaritanController:
             logger.error(f"No configuration found for PDU {pdu_ip}")
             return None
         
-        command = f"show /system1/outlet{outlet}"
+        command = f"show outlets {outlet}"
         stdout, stderr = pdu.execute_command(command)
         
         if stderr:
@@ -349,9 +437,9 @@ class RaritanController:
             return None
         
         # Parse the status from the output
-        match = re.search(r'powerState\s*=\s*([^\s,]+)', stdout)
+        match = re.search(r'(on|off)', stdout, re.IGNORECASE)
         if match:
-            return match.group(1)
+            return match.group(1).upper()
         
         logger.warning(f"Could not parse status for outlet {outlet} on PDU {pdu_ip}")
         return None
@@ -363,7 +451,7 @@ class RaritanController:
             logger.error(f"No configuration found for PDU {pdu_ip}")
             return {}
         
-        command = "show /system1/outlets"
+        command = "show outlets"
         stdout, stderr = pdu.execute_command(command)
         
         if stderr:
@@ -372,10 +460,10 @@ class RaritanController:
         
         results = {}
         # Parse status for each outlet
-        outlet_pattern = r'/system1/outlet(\d+)\s+.*powerState=([^\s,]+)'
+        outlet_pattern = r'outlets (\d+)\s+(on|off)'
         for match in re.finditer(outlet_pattern, stdout):
             outlet = int(match.group(1))
-            status = match.group(2)
+            status = match.group(2).upper()
             results[outlet] = status
         
         return results
@@ -505,38 +593,114 @@ def format_status_table(results: Dict[str, Dict[int, str]], server_name: Optiona
     
     return table.get_string()
 
+def format_summary(operation: str, target: str, success: bool, details: Optional[Dict] = None) -> str:
+    """Format a summary of the operation results"""
+    table = PrettyTable()
+    table.field_names = ["Operation", "Target", "Result", "Details"]
+    
+    result = "SUCCESS" if success else "FAILED"
+    detail_str = ""
+    
+    if details:
+        if 'outlets' in details:
+            outlets_str = ', '.join(str(o) for o in details['outlets'])
+            detail_str += f"Outlets: {outlets_str}\n"
+        if 'pdus' in details:
+            pdus_str = ', '.join(details['pdus'])
+            detail_str += f"PDUs: {pdus_str}\n"
+        if 'message' in details:
+            detail_str += details['message']
+    
+    table.add_row([operation.upper(), target, result, detail_str])
+    return table.get_string()
+
 def main():
     """Main entry point (server first, command last)"""
     args = parse_arguments()
     if args.verbose:
         logger.setLevel(logging.DEBUG)
     controller = RaritanController(config_file=args.config)
+    
+    # Variables to track for summary
+    success = False
+    details = {}
+    
     # Execute the requested command
     if args.command == 'on':
         if args.server:
+            details['target_type'] = 'server'
             success = controller.operate_on_server(args.server, 'on')
-            print(f"Power on {'successful' if success else 'failed'} for server {args.server}")
+            # Collect PDUs and outlets for server
+            server_config = controller.get_server_config(args.server)
+            if server_config and server_config.outlets:
+                details['pdus'] = [outlet_config['pdu_name'] for outlet_config in server_config.outlets]
+                outlets = []
+                for outlet_config in server_config.outlets:
+                    outlet_str = outlet_config['outlet_number']
+                    if isinstance(outlet_str, str):
+                        outlets.extend([int(o.strip()) for o in outlet_str.split(',') if o.strip()])
+                    else:
+                        outlets.append(outlet_str)
+                details['outlets'] = outlets
         else:
+            details['target_type'] = 'outlet'
+            details['pdus'] = [args.pdu]
+            details['outlets'] = [args.outlet]
             success = controller.power_on_outlet(args.pdu, args.outlet)
-            print(f"Power on {'successful' if success else 'failed'} for outlet {args.outlet} on PDU {args.pdu}")
+    
     elif args.command == 'off':
         if args.server:
+            details['target_type'] = 'server'
             success = controller.operate_on_server(args.server, 'off')
-            print(f"Power off {'successful' if success else 'failed'} for server {args.server}")
+            # Collect PDUs and outlets for server
+            server_config = controller.get_server_config(args.server)
+            if server_config and server_config.outlets:
+                details['pdus'] = [outlet_config['pdu_name'] for outlet_config in server_config.outlets]
+                outlets = []
+                for outlet_config in server_config.outlets:
+                    outlet_str = outlet_config['outlet_number']
+                    if isinstance(outlet_str, str):
+                        outlets.extend([int(o.strip()) for o in outlet_str.split(',') if o.strip()])
+                    else:
+                        outlets.append(outlet_str)
+                details['outlets'] = outlets
         else:
+            details['target_type'] = 'outlet'
+            details['pdus'] = [args.pdu]
+            details['outlets'] = [args.outlet]
             success = controller.power_off_outlet(args.pdu, args.outlet)
-            print(f"Power off {'successful' if success else 'failed'} for outlet {args.outlet} on PDU {args.pdu}")
+    
     elif args.command == 'cycle':
         if args.server:
+            details['target_type'] = 'server'
             success = controller.operate_on_server(args.server, 'cycle')
-            print(f"Power cycle {'successful' if success else 'failed'} for server {args.server}")
+            # Collect PDUs and outlets for server
+            server_config = controller.get_server_config(args.server)
+            if server_config and server_config.outlets:
+                details['pdus'] = [outlet_config['pdu_name'] for outlet_config in server_config.outlets]
+                outlets = []
+                for outlet_config in server_config.outlets:
+                    outlet_str = outlet_config['outlet_number']
+                    if isinstance(outlet_str, str):
+                        outlets.extend([int(o.strip()) for o in outlet_str.split(',') if o.strip()])
+                    else:
+                        outlets.append(outlet_str)
+                details['outlets'] = outlets
         else:
+            details['target_type'] = 'outlet'
+            details['pdus'] = [args.pdu]
+            details['outlets'] = [args.outlet]
             success = controller.power_cycle_outlet(args.pdu, args.outlet, args.delay)
-            print(f"Power cycle {'successful' if success else 'failed'} for outlet {args.outlet} on PDU {args.pdu}")
+    
     elif args.command == 'status':
         if args.server:
             results = controller.get_server_outlet_status(args.server)
             print(format_status_table(results, args.server))
+            # Success if we got any results
+            success = bool(results)
+            details['target_type'] = 'server'
+            # Don't need to print a summary for status command
+            return
         else:
             pdu = controller.get_pdu_config(args.pdu)
             if not pdu:
@@ -553,8 +717,35 @@ def main():
                     status_dict = controller.get_all_pdu_outlet_status(args.pdu)
                     results = {args.pdu: status_dict}
                 print(format_status_table(results))
+                # Success if we got any results
+                success = bool(results)
+                details['target_type'] = 'pdu'
+                # Don't need to print a summary for status command
+                return
             finally:
                 pdu.disconnect()
+    
+    # Generate target string for summary
+    target = ""
+    if 'target_type' in details:
+        if details['target_type'] == 'server':
+            target = f"Server: {args.server}"
+        elif details['target_type'] == 'outlet':
+            target = f"Outlet: {args.outlet} on PDU: {args.pdu}"
+        elif details['target_type'] == 'pdu':
+            target = f"PDU: {args.pdu}"
+    
+    # Print the summary for non-status commands
+    if args.command != 'status':
+        # Get the current status for the target if the operation was successful
+        if success and (args.command == 'on' or args.command == 'off' or args.command == 'cycle'):
+            details['message'] = f"Power {args.command} operation completed."
+            if args.command == 'cycle':
+                details['message'] += f" Delay used: {args.delay or controller.defaults.get('power_on_delay', 5)} seconds."
+        
+        print("\n----- OPERATION SUMMARY -----")
+        print(format_summary(args.command, target, success, details))
+        print("-----------------------------\n")
 
 if __name__ == '__main__':
     main()
