@@ -408,7 +408,7 @@ class RaritanController:
 
     def power_cycle_outlet(self, pdu_ip: str, outlets: Union[int, list], delay: Optional[int] = None) -> bool:
         """Power cycle one or more outlets on a PDU (new command format)"""
-        delay = delay or self.defaults.get('power_on_delay', 5)
+        delay = delay or 30  # Default to 30 seconds if not specified
         if isinstance(outlets, int):
             outlet_list = [outlets]
         else:
@@ -468,7 +468,7 @@ class RaritanController:
         
         return results
     
-    def operate_on_server(self, server_name: str, operation: str) -> bool:
+    def operate_on_server(self, server_name: str, operation: str, delay: Optional[int] = None) -> bool:
         """Perform a power operation on all outlets for a server (new YAML format, new command format)"""
         server = self.get_server_config(server_name)
         if not server:
@@ -512,7 +512,7 @@ class RaritanController:
                 elif operation == 'off':
                     result = self.power_off_outlet(pdu_ip, outlet_list)
                 elif operation == 'cycle':
-                    result = self.power_cycle_outlet(pdu_ip, outlet_list)
+                    result = self.power_cycle_outlet(pdu_ip, outlet_list, delay or 30)
                 success = success and result
             return success
         finally:
@@ -673,7 +673,7 @@ def main():
     elif args.command == 'cycle':
         if args.server:
             details['target_type'] = 'server'
-            success = controller.operate_on_server(args.server, 'cycle')
+            success = controller.operate_on_server(args.server, 'cycle', args.delay)
             # Collect PDUs and outlets for server
             server_config = controller.get_server_config(args.server)
             if server_config and server_config.outlets:
