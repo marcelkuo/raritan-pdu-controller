@@ -406,22 +406,6 @@ class RaritanController:
         logger.info(f"Powered off outlet(s) {outlet_str} on PDU {pdu_ip}")
         return True
 
-    def power_cycle_outlet(self, pdu_ip: str, outlets: Union[int, list], delay: Optional[int] = None) -> bool:
-        """Power cycle one or more outlets on a PDU (new command format)"""
-        delay = delay or 30  # Default to 30 seconds if not specified
-        if isinstance(outlets, int):
-            outlet_list = [outlets]
-        else:
-            outlet_list = outlets
-        outlet_str = ','.join(str(o) for o in outlet_list)
-        # Power off
-        if not self.power_off_outlet(pdu_ip, outlet_list):
-            return False
-        logger.info(f"Waiting {delay} seconds before powering on outlet(s) {outlet_str} on PDU {pdu_ip}")
-        time.sleep(delay)
-        # Power on
-        return self.power_on_outlet(pdu_ip, outlet_list)
-    
     def get_outlet_status(self, pdu_ip: str, outlet: int) -> Optional[str]:
         """Get the status of a specific outlet on a PDU"""
         pdu = self.get_pdu_config(pdu_ip)
@@ -469,7 +453,18 @@ class RaritanController:
         return results
     
     def operate_on_server(self, server_name: str, operation: str, delay: Optional[int] = None) -> bool:
-        """Perform a power operation on all outlets for a server (new YAML format, new command format)"""
+        """
+        Perform a power operation on all outlets for a server.
+        
+        For power cycle operations, this will:
+        1. Connect to all PDUs first
+        2. Turn off all outlets on all PDUs
+        3. Wait for the specified delay (30 seconds by default)
+        4. Turn on all outlets on all PDUs
+        
+        This ensures that for servers with multiple power supplies connected to different PDUs,
+        all power supplies are turned off before any are turned back on.
+        """
         server = self.get_server_config(server_name)
         if not server:
             logger.error(f"No configuration found for server {server_name}")
@@ -477,49 +472,145 @@ class RaritanController:
         if not server.outlets:
             logger.error(f"No outlets configured for server {server_name}")
             return False
-        success = True
-        used_pdus = set()
+        
+        # Set default delay for cycle operations
+        if operation == 'cycle':
+            delay = delay or 30  # Default to 30 seconds if not specified
+            
+        # Group outlets by PDU for batch commands
+        pdu_outlet_map = {}
+        for outlet_config in server.outlets:
+            pdu_ip = outlet_config['pdu_name']
+            outlet_number = outlet_config['outlet_number']
+            
+            # Convert outlet_number to a list of integers
+            if isinstance(outlet_number, int):
+                outlet_numbers = [outlet_number]
+            elif isinstance(outlet_number, str):
+                outlet_numbers = [int(x.strip()) for x in outlet_number.split(',') if x.strip()]
+            else:
+                continue
+                
+            # Add to PDU outlet map
+            if pdu_ip not in pdu_outlet_map:
+                pdu_outlet_map[pdu_ip] = []
+            pdu_outlet_map[pdu_ip].extend(outlet_numbers)
+        
+        # For logging purposes
+        total_outlets = sum(len(outlets) for outlets in pdu_outlet_map.values())
+        total_pdus = len(pdu_outlet_map)
+        
+        # Connect to all PDUs first
+        used_pdus = {}  # Store PDU objects keyed by IP
+        for pdu_ip in pdu_outlet_map.keys():
+            pdu = self.get_pdu_config(pdu_ip)
+            if not pdu:
+                logger.error(f"No configuration found for PDU {pdu_ip}")
+                continue
+                
+            if not pdu.connect():
+                logger.error(f"Failed to connect to PDU {pdu_ip}")
+                continue
+                
+            used_pdus[pdu_ip] = pdu
+        
+        # Check if we have all PDUs connected
+        if len(used_pdus) != total_pdus:
+            logger.error(f"Failed to connect to all PDUs for server {server_name}. Connected to {len(used_pdus)}/{total_pdus}")
+            # Disconnect from any connected PDUs
+            for pdu in used_pdus.values():
+                pdu.disconnect()
+            return False
+        
         try:
-            # Group outlets by PDU for batch command
-            pdu_outlet_map = {}
-            for outlet_config in server.outlets:
-                pdu_ip = outlet_config['pdu_name']
-                outlet_number = outlet_config['outlet_number']
-                if isinstance(outlet_number, int):
-                    outlet_numbers = [outlet_number]
-                elif isinstance(outlet_number, str):
-                    outlet_numbers = [int(x.strip()) for x in outlet_number.split(',') if x.strip()]
-                else:
-                    continue
-                if pdu_ip not in pdu_outlet_map:
-                    pdu_outlet_map[pdu_ip] = []
-                pdu_outlet_map[pdu_ip].extend(outlet_numbers)
-            for pdu_ip, outlet_list in pdu_outlet_map.items():
-                pdu = self.get_pdu_config(pdu_ip)
-                if not pdu:
-                    logger.error(f"No configuration found for PDU {pdu_ip}")
-                    success = False
-                    continue
-                if pdu_ip not in used_pdus:
-                    if not pdu.connect():
-                        logger.error(f"Failed to connect to PDU {pdu_ip}")
-                        success = False
-                        continue
-                    used_pdus.add(pdu_ip)
-                result = False
-                if operation == 'on':
-                    result = self.power_on_outlet(pdu_ip, outlet_list)
-                elif operation == 'off':
+            # Different handling based on operation type
+            if operation == 'cycle':
+                logger.info(f"POWER CYCLE: Coordinated power cycle for server {server_name} - {total_outlets} outlets on {total_pdus} PDUs")
+                
+                # Step 1: Turn OFF all outlets on all PDUs
+                logger.info(f"POWER CYCLE step 1: Turning OFF all outlets for server {server_name}")
+                off_results = {}
+                
+                for pdu_ip, outlet_list in pdu_outlet_map.items():
+                    outlet_str = ','.join(str(o) for o in outlet_list)
+                    logger.info(f"- Turning OFF outlets {outlet_str} on PDU {pdu_ip}")
                     result = self.power_off_outlet(pdu_ip, outlet_list)
-                elif operation == 'cycle':
-                    result = self.power_cycle_outlet(pdu_ip, outlet_list, delay or 30)
-                success = success and result
-            return success
+                    off_results[pdu_ip] = result
+                    
+                    if not result:
+                        logger.error(f"  Failed to turn OFF outlets {outlet_str} on PDU {pdu_ip}")
+                
+                # Check if all turn-off operations succeeded
+                all_off_success = all(off_results.values())
+                if not all_off_success:
+                    failed_pdus = [pdu_ip for pdu_ip, result in off_results.items() if not result]
+                    logger.error(f"POWER CYCLE FAILED: Could not turn off outlets on PDUs: {', '.join(failed_pdus)}")
+                    return False
+                
+                # Step 2: Wait for the specified delay
+                logger.info(f"POWER CYCLE step 2: All outlets turned OFF successfully. Waiting {delay} seconds before power ON")
+                time.sleep(delay)
+                
+                # Step 3: Turn ON all outlets on all PDUs
+                logger.info(f"POWER CYCLE step 3: Turning ON all outlets for server {server_name}")
+                on_results = {}
+                
+                for pdu_ip, outlet_list in pdu_outlet_map.items():
+                    outlet_str = ','.join(str(o) for o in outlet_list)
+                    logger.info(f"- Turning ON outlets {outlet_str} on PDU {pdu_ip}")
+                    result = self.power_on_outlet(pdu_ip, outlet_list)
+                    on_results[pdu_ip] = result
+                    
+                    if not result:
+                        logger.error(f"  Failed to turn ON outlets {outlet_str} on PDU {pdu_ip}")
+                
+                # Check if all turn-on operations succeeded
+                all_on_success = all(on_results.values())
+                if not all_on_success:
+                    failed_pdus = [pdu_ip for pdu_ip, result in on_results.items() if not result]
+                    logger.error(f"POWER CYCLE INCOMPLETE: Could not turn on outlets on PDUs: {', '.join(failed_pdus)}")
+                    return False
+                    
+                logger.info(f"POWER CYCLE COMPLETE: Successfully cycled power for server {server_name}")
+                return True
+                
+            elif operation == 'on' or operation == 'off':
+                # For on/off operations, process each PDU
+                logger.info(f"POWER {operation.upper()}: Turning {operation} server {server_name}")
+                results = {}
+                
+                for pdu_ip, outlet_list in pdu_outlet_map.items():
+                    outlet_str = ','.join(str(o) for o in outlet_list)
+                    logger.info(f"- Turning {operation.upper()} outlets {outlet_str} on PDU {pdu_ip}")
+                    
+                    if operation == 'on':
+                        result = self.power_on_outlet(pdu_ip, outlet_list)
+                    else:  # operation == 'off'
+                        result = self.power_off_outlet(pdu_ip, outlet_list)
+                        
+                    results[pdu_ip] = result
+                    
+                    if not result:
+                        logger.error(f"  Failed to turn {operation.upper()} outlets {outlet_str} on PDU {pdu_ip}")
+                
+                # Check if all operations succeeded
+                all_success = all(results.values())
+                if not all_success:
+                    failed_pdus = [pdu_ip for pdu_ip, result in results.items() if not result]
+                    logger.error(f"POWER {operation.upper()} INCOMPLETE: Failed on PDUs: {', '.join(failed_pdus)}")
+                    return False
+                    
+                logger.info(f"POWER {operation.upper()} COMPLETE: Successfully turned {operation} server {server_name}")
+                return True
+                
+            else:
+                logger.error(f"Invalid operation: {operation}")
+                return False
+                
         finally:
-            for pdu_ip in used_pdus:
-                pdu = self.get_pdu_config(pdu_ip)
-                if pdu:
-                    pdu.disconnect()
+            # Disconnect from all PDUs
+            for pdu in used_pdus.values():
+                pdu.disconnect()
     
     def get_server_outlet_status(self, server_name: str) -> Dict[str, Dict[int, str]]:
         """Get the status of all outlets for a server (new YAML format)"""
@@ -690,7 +781,40 @@ def main():
             details['target_type'] = 'outlet'
             details['pdus'] = [args.pdu]
             details['outlets'] = [args.outlet]
-            success = controller.power_cycle_outlet(args.pdu, args.outlet, args.delay)
+            
+            # Handle single outlet cycle operation
+            delay = args.delay or 30  # Default to 30 seconds
+            pdu = controller.get_pdu_config(args.pdu)
+            if not pdu:
+                logger.error(f"No configuration found for PDU {args.pdu}")
+                success = False
+            else:
+                try:
+                    # Connect to PDU
+                    if not pdu.connect():
+                        logger.error(f"Failed to connect to PDU {args.pdu}")
+                        success = False
+                    else:
+                        # Step 1: Turn off outlet
+                        logger.info(f"POWER CYCLE: Turning OFF outlet {args.outlet} on PDU {args.pdu}")
+                        if not controller.power_off_outlet(args.pdu, args.outlet):
+                            logger.error(f"Failed to turn OFF outlet {args.outlet} on PDU {args.pdu}")
+                            success = False
+                        else:
+                            # Step 2: Wait
+                            logger.info(f"POWER CYCLE: Waiting {delay} seconds before powering ON outlet {args.outlet} on PDU {args.pdu}")
+                            time.sleep(delay)
+                            
+                            # Step 3: Turn on outlet
+                            logger.info(f"POWER CYCLE: Turning ON outlet {args.outlet} on PDU {args.pdu}")
+                            success = controller.power_on_outlet(args.pdu, args.outlet)
+                            if not success:
+                                logger.error(f"Failed to turn ON outlet {args.outlet} on PDU {args.pdu}")
+                            else:
+                                logger.info(f"POWER CYCLE COMPLETE: Successfully cycled power for outlet {args.outlet} on PDU {args.pdu}")
+                finally:
+                    # Ensure we disconnect
+                    pdu.disconnect()
     
     elif args.command == 'status':
         if args.server:
@@ -741,7 +865,7 @@ def main():
         if success and (args.command == 'on' or args.command == 'off' or args.command == 'cycle'):
             details['message'] = f"Power {args.command} operation completed."
             if args.command == 'cycle':
-                details['message'] += f" Delay used: {args.delay or controller.defaults.get('power_on_delay', 5)} seconds."
+                details['message'] += f" Delay used: {args.delay or 30} seconds."
         
         print("\n----- OPERATION SUMMARY -----")
         print(format_summary(args.command, target, success, details))
